@@ -1,0 +1,408 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+
+using Rhino;
+using Rhino.Geometry;
+
+using Grasshopper;
+using Grasshopper.Kernel;
+using Grasshopper.Kernel.Data;
+using Grasshopper.Kernel.Types;
+
+using System.IO;
+using System.Linq;
+using System.Data;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+using System.Xml;
+using System.Xml.Linq;
+using System.Runtime.InteropServices;
+
+using Rhino.DocObjects;
+using Rhino.Collections;
+using GH_IO;
+using GH_IO.Serialization;
+
+
+public class Script_Instance : GH_ScriptInstance
+{
+#region Utility functions
+  /// <summary>Print a String to the [Out] Parameter of the Script component.</summary>
+  /// <param name="text">String to print.</param>
+  private void Print(string text) { /* Implementation hidden. */ }
+  /// <summary>Print a formatted String to the [Out] Parameter of the Script component.</summary>
+  /// <param name="format">String format.</param>
+  /// <param name="args">Formatting parameters.</param>
+  private void Print(string format, params object[] args) { /* Implementation hidden. */ }
+  /// <summary>Print useful information about an object instance to the [Out] Parameter of the Script component. </summary>
+  /// <param name="obj">Object instance to parse.</param>
+  private void Reflect(object obj) { /* Implementation hidden. */ }
+  /// <summary>Print the signatures of all the overloads of a specific method to the [Out] Parameter of the Script component. </summary>
+  /// <param name="obj">Object instance to parse.</param>
+  private void Reflect(object obj, string method_name) { /* Implementation hidden. */ }
+#endregion
+
+#region Members
+  /// <summary>Gets the current Rhino document.</summary>
+  private readonly RhinoDoc RhinoDocument;
+  /// <summary>Gets the Grasshopper document that owns this script.</summary>
+  private readonly GH_Document GrasshopperDocument;
+  /// <summary>Gets the Grasshopper script component that owns this script.</summary>
+  private readonly IGH_Component Component;
+  /// <summary>
+  /// Gets the current iteration count. The first call to RunScript() is associated with Iteration==0.
+  /// Any subsequent call within the same solution will increment the Iteration count.
+  /// </summary>
+  private readonly int Iteration;
+#endregion
+
+  /// <summary>
+  /// This procedure contains the user code. Input parameters are provided as regular arguments,
+  /// Output parameters as ref arguments. You don't have to assign output parameters,
+  /// they will have a default value.
+  /// </summary>
+  private void RunScript(List<Point3d> supports, List<Line> lines, double springStiffness, double systemDamping, double nodeMass, bool initialize, bool run, double timestep, double appliedLoad, ref object A, ref object B, ref object C, ref object D, ref object E)
+  {
+    // 動態放鬆模擬
+
+    // 動態鬆弛腳本的輸入來自 Grasshopper。
+    // 輸入為 Rhino 幾何，包括線段和 3D 點。
+    // 線段構成網格殼模型，位置作為固定支撐點。
+    // 網格殼的輸入不必為平面，且可以已具備期望的形狀。
+    // 腳本的輸出是一組放鬆後的線段，形成放鬆狀態的網格殼形態。
+    
+    // 此腳本基於面向對象編程構建。對象由彈簧和節點構成的彈簧系統組成，節點是彈簧的連接點。
+    // 整體結構由三個類別構成：
+    //   1. 主類別 `SpringSystem`，負責創建並管理由兩個子類別生成的對象集合。
+    //   2. 子類別 `Node`，用於定義節點。
+    //   3. 子類別 `Spring`，用於定義彈簧。
+    
+    // 腳本連接到 Grasshopper 的計時器機制。計時器會以用戶設定的時間間隔更新腳本輸出。
+    // 這意味著每個時間間隔，腳本的新線段輸出都會在 Grasshopper 中被更新。
+    
+    // C# 腳本組件連接到 Grasshopper 中的bool。當bool為 `true` 時，此邏輯操作將通過調用 `SpringSystem` 對象中的 `build` 方法來初始化系統。
+    // 它還會重置所有列表，確保 `SpringSystem` 對象不包含任何先前構建的信息。
+
+
+    if (initialize) {
+        sys.resetLists();         // 重置所有列表，使其可以準備容納新的系統。
+        sys.Build(lines);         // 通過執行 SpringSystem 類中的 build 方法來構建系統。
+        sys.SetSupport(supports); // 調用方法來設定節點是否為支撐節點。
+    }
+    
+    // 此功能也與布爾開關相關聯。
+    // 當開關為 true 時，系統運行 SpringSystem 類中的方法，讓系統運動。
+    // 當開關為 false 時，腳本將停止更新幾何。
+    else if (run) {
+        sys.dt = Math.Sqrt(2 * sys.mass / sys.stiffness) * timestep; // 此表達式確定 Verlet 積分的快速收斂時間步長。步長過大會導致積分失敗，過小則會延長收斂時間。
+        sys.damping = systemDamping; // 阻尼值持續更新，允許用戶動態調整阻尼值。
+        sys.mass = nodeMass;        // 節點質量也可以在腳本運行時進行更改。更改質量後，系統將自適應並生成新幾何。
+        sys.stiffness = springStiffness;  // 彈簧剛度也可以在腳本運行時更改。這允許用戶觀察系統如何響應彈簧剛度的變化。
+        sys.UpdateMass();           // 更新節點質量所需的函數，在構建系統後執行。
+        sys.UpdateStiffness();      // 更新彈簧剛度所需的函數，在構建系統後執行。
+        sys.Move();                 // 核心邏輯所在。此函數調用方法計算彈簧內的力，並使用 Verlet 積分更新節點位置。
+        sys.load = appliedLoad;     // 設置系統中的應用負載。
+    }
+    
+    // 以下的 Print 語句用於在腳本中跟蹤統計數據，也用於早期定位錯誤。
+
+
+    Print("Number of nodes: " + sys.nodes.Count);
+    Print("Number of springs: " + sys.springs.Count);
+    Print("Number of supports: " + supports.Count);
+    Print("Current Energy: " + sys.currentEnergy);
+    //Print("Damping: " + sys.damping);
+    //Print("Stiffness: " + sys.stiffness);
+
+    //Print("Previous Energy: " + sys.prevEnergy);
+    //Print("Energy difference: " + sys.diffEnergy);
+    //Print("Rest length: " + sys.springs[0].restLength);
+    //Print("Strain: " + sys.springs[0].Strain(sys.positions));
+    //foreach (Node node in sys.nodes) Print("Node:" + node.springs.Count);
+    foreach (Spring spring in sys.springs) Print("Length: " + spring.Length(sys.currentPositions));
+    //foreach (Spring spring in sys.springs) Print("strain: " + spring.Strain(sys.currentPositions));
+    //foreach (Spring spring in sys.springs) Print("Force: " + spring.Force(sys.currentPositions));
+    //Print("Number of current positions: " + sys.currentPositions.Count);
+    //Print("Number of  positions: " + sys.positions.Count);
+    //foreach (Vector3d position in sys.positions) Print("Position: " + position);
+    //foreach (Node node in sys.nodes) Print("Support: " + node.support);
+    //foreach (Vector3d currentPosition in sys.currentPositions) Print("currentPosition: " + currentPosition);
+
+    // 以下表達式處理腳本的輸出。這些代碼行允許腳本將數據和幾何輸出到 Grasshopper。
+    A = sys.Draw(sys.currentPositions); // 主要輸出。Draw 方法使用放鬆後的節點位置創建新的 Rhino 幾何線段。
+    B = sys.histEnergy; // 系統能量的歷史數據列表，持續增長。能量的變化被跟蹤並繪製，以可視化腳本何時收斂。
+    C = sys.currentPositions; // 節點當前位置的向量列表，表示移動後的節點位置。
+    D = sys.currentEnergy; // 腳本的當前能量。
+    E = sys.diffEnergy; // 與之前相比，腳本能量的差異。這部分用於跟蹤收斂情況，並可能用於添加腳本中斷功能。
+
+  }
+
+  // <Custom additional code> 
+
+  SpringSystem sys = new SpringSystem(); // 創建彈簧對象.
+
+
+    // Node 類接收一個 Rhino 幾何輸入（以 3D 位置向量的形式）並返回一個節點對象。
+    // 該類執行操作以檢查該位置是否為固定支撐，並跟蹤與該節點相連的彈簧對象。
+    public class Node {
+        // Node 類的屬性。
+        public int index;             // 節點的索引值，用於在節點列表中跟蹤特定節點。
+        public double mass;           // 節點的虛擬質量，此值可以通過 Grasshopper 的質量滑塊輸入進行修改。
+        public List<Spring> springs;  // 與節點相連的彈簧對象列表。
+        public bool support;          // 節點是否為支撐點（true 或 false）。該值由 Spring 系統內的方法設置，後續在 Verlet 積分中檢查該節點是否應該移動。
+    
+        // 無參構造函數，用於初始化對象。
+        public Node() {
+        }
+    
+        // 構造函數，使用指定的索引和質量初始化節點對象。
+        // 自動插入一個空的彈簧列表，並默認將支撐值設置為 false。
+        public Node(double _mass, int _index) { // 在創建節點對象時，必須指定質量和索引值。
+            index = _index;   // 節點在節點列表中的整數索引值。
+            mass = _mass;     // 節點的虛擬質量。
+            support = false;  // 默認的支撐值（false）。
+            springs = new List<Spring>(); // 初始化為與節點相連的空彈簧列表。
+        }
+    }
+
+
+    // Spring 類包含計算彈簧長度、應變和彈簧力的方法。
+    // 此外，該類還提供一個方法，用於生成新的 Rhino 線段幾何以便後續輸出。
+    // 創建一個 Spring 對象需要以下參數：起始節點、結束節點、彈簧剛度、彈簧在彈簧列表中的索引，以及彈簧的靜止長度。
+  public class Spring{
+    //Spring class properties.
+    public int index; 		    // Spring index.
+    public Node start; 	    	// Start node.
+    public Node end; 		      // End node
+    public double stiffness; 	// Spring stiffness.
+    public double restLength;	// Spring rest length.
+
+    // 空構造函數
+    public Spring() {
+    }
+
+    // 構造函數，接受五個參數：起始節點、結束節點、彈簧剛度、彈簧的索引以及彈簧的靜止長度。
+    public Spring(Node _start, Node _end, double _stiffness, int _index, double _restLength) {
+        start = _start; // 彈簧的起始節點。
+        end = _end;   // 彈簧的結束節點。
+        stiffness = _stiffness; // 彈簧剛度。
+        index = _index; // 彈簧在列表中的索引。
+        restLength = _restLength; // 彈簧的靜止長度。
+        start.springs.Add(this);  // 將當前彈簧（this）添加到起始節點的彈簧列表中，確保節點記錄與其相連的彈簧。
+        end.springs.Add(this);  // 將當前彈簧（this）也添加到結束節點的彈簧列表中。
+    }
+    
+    // 計算彈簧當前長度的方法。
+    public double Length(List<Vector3d> _positions) { // 此方法接受節點位置向量列表作為輸入。
+        Vector3d dir = _positions[end.index] - _positions[start.index]; // 創建一個方向向量，從起始節點位置指向結束節點位置。
+        return dir.Length; // 返回該向量的長度，作為彈簧的當前長度。
+    }
+    
+    // 計算彈簧應變的方法。
+    public double Strain(List<Vector3d> _positions) { // 此方法使用與 Length 方法相同的節點位置向量列表。
+        return (Length(_positions) - restLength) / restLength; // 應變計算為當前長度與靜止長度的相對差異。
+    }
+    
+    // 計算彈簧力的方法。
+    public Vector3d Force(List<Vector3d> _positions) { // 此方法使用相同的節點位置向量列表作為輸入。
+        Vector3d dir = _positions[start.index] - _positions[end.index]; // 與 Length 方法一樣創建一個方向向量。
+        dir.Unitize(); // 將方向向量單位化，使其長度為 1。
+        double mag = Strain(_positions) * stiffness; // 根據胡克定律計算力的大小：F = -k * x，其中 k 是剛度，x 是應變。
+        return dir * mag; // 返回乘以力大小的單位向量，作為彈簧力向量。
+    }
+    
+    // 創建新的 Rhino 線段幾何。
+    public Line NewLine(List<Vector3d> _positions) {
+        Point3d point1 = new Point3d(_positions[start.index].X, _positions[start.index].Y, _positions[start.index].Z);
+        Point3d point2 = new Point3d(_positions[end.index].X, _positions[end.index].Y, _positions[end.index].Z);
+        return new Line(point1, point2); // 返回由節點位置生成的線段。
+    }
+
+
+  // SpringSystem 是主類別。
+  // 它調用 Spring 類和 Node 類的方法。
+
+  public class SpringSystem {
+    public List<Spring> springs;
+    public List<Node> nodes;
+    public List<Vector3d> positions;
+    public List<Vector3d> prevPositions;
+    public List<Vector3d> currentPositions;
+    public List<Vector3d> resForces;
+    public double damping;
+    public double prevEnergy;
+    public double currentEnergy;
+    public double diffEnergy;
+    public List<double> histEnergy;
+    public double mass;
+    public double dt;
+    public double load;
+    public double stiffness;
+    //Initialize the lists.
+    public SpringSystem() {
+      resetLists();
+
+    }
+
+    // 通過調用 Spring 類，從 Rhino 幾何創建彈簧對象的方法。
+
+    // 方法：從 Rhino 幾何創建彈簧對象。
+    public Spring AddSpring(Line line, double stiffness) {
+        Vector3d startvec = new Vector3d(line.From.X, line.From.Y, line.From.Z); // 獲取線段的起始點作為向量。
+        Vector3d endvec = new Vector3d(line.To.X, line.To.Y, line.To.Z);         // 獲取線段的結束點作為向量。
+        Node start = AddNode(startvec, mass); // 獲取或創建起始節點，質量設置為默認值（可以通過滑塊輸入）。
+        Node end = AddNode(endvec, mass);     // 獲取或創建結束節點。
+        Spring spring = new Spring(start, end, stiffness, springs.Count(), line.Length); // 通過構造函數創建新彈簧對象。
+        springs.Add(spring); // 將彈簧對象添加到彈簧列表中。
+        return spring;       // 返回新創建的彈簧對象。
+    }
+    
+    // 方法：創建節點及其位置，並將它們添加到節點和位置列表中。
+    // 該方法內置檢查機制，用於判斷節點是否已經存在。
+    public Node AddNode(Vector3d position, double mass) {
+        int index = positions.IndexOf(position); // 在位置列表中搜索指定位置。如果未找到，返回 -1。
+        if (index == -1) { // 如果位置不存在，繼續創建新節點。
+            Node node = new Node(mass, nodes.Count()); // 調用 Node 類構造函數創建新節點。節點的索引設置為當前節點列表的長度。
+            nodes.Add(node);      // 將節點添加到節點列表中。
+            positions.Add(position); // 將位置向量添加到位置列表中。
+            return node;          // 返回新創建的節點。
+        } else {
+            return nodes[index];  // 如果位置已存在，返回現有節點。
+        }
+    }
+
+
+    public void resetLists() {
+      springs = new List<Spring>();
+      nodes = new List<Node>();
+      positions = new List<Vector3d>();
+      prevPositions = new List<Vector3d>();
+      currentPositions = new List<Vector3d>();
+      resForces = new List<Vector3d>();
+      histEnergy = new List<double>();
+      prevEnergy = 0;
+      currentEnergy = 0;
+    }
+
+    // build 方法通過對模型中的所有線段調用 addSpring 方法來創建對象。
+    public void Build(List < Line > lines) {
+      foreach (Line line in lines) {
+        AddSpring(line, stiffness); 	// 在列表中的所有線段上調用 AddSpring 函數。彈簧剛度可以動態更改。
+      }
+      foreach (Vector3d position in positions) {
+        prevPositions.Add(new Vector3d(position.X, position.Y, position.Z));
+        currentPositions.Add(new Vector3d(position.X, position.Y, position.Z));
+        resForces.Add(new Vector3d());
+
+      }
+
+    }
+
+
+    public void SetSupport(List < Point3d > supports){
+      foreach (Point3d point in supports){
+        Vector3d temp = new Vector3d(point.X, point.Y, point.Z);
+        int nodeIndex = positions.IndexOf(temp);
+        if (nodeIndex != -1) {
+          nodes[nodeIndex].support = true;
+        }
+      }
+    }
+
+    public void SetForces(List < Vector3d > _positions){
+
+      foreach (Node node in nodes){
+        Vector3d nodeForce = new Vector3d(0, 0, 0);
+        foreach (Spring spring in node.springs){
+          if (spring.start == node){
+            nodeForce -= spring.Force(_positions);
+
+          } else {
+            nodeForce += spring.Force(_positions);
+          }
+        }
+        resForces[node.index] = nodeForce;
+      }
+    }
+
+    public void Verlet(){
+      currentEnergy = 0;
+      foreach (Node node in nodes) {
+        if (node.support == false) {
+          Vector3d currentPosition = currentPositions[node.index];
+
+          //Acceleration
+          Vector3d a = resForces[node.index] / node.mass;
+          Vector3d loadvec = new Vector3d(0, 0, load);
+          a += loadvec;
+
+          //Velocity
+          Vector3d v = currentPosition - prevPositions[node.index];
+
+          //Calculate next position
+          Vector3d nextPosition = currentPosition + (1 - damping) * v + a * dt * dt;
+
+          //Calculate energy
+          currentEnergy += 0.5 * node.mass * v.Length * v.Length;
+
+
+          //Store position
+          prevPositions[node.index] = currentPosition;
+
+          //Update position
+          currentPositions[node.index] = nextPosition;
+        }
+      }
+
+
+      histEnergy.Add(currentEnergy * 1000000);
+
+      double sum1 = 0;
+      double sum2 = 0;
+
+      int numEnergy = histEnergy.Count;
+
+      if (numEnergy > 11){
+        for (int i = numEnergy - 1 ; i > numEnergy - 6 ; i--){
+          sum1 += Math.Abs(histEnergy[i] - histEnergy[i - 5]);
+          sum2 += histEnergy[i];
+        }
+        diffEnergy = sum1 / sum2;
+      }
+    }
+
+
+    public void UpdateStiffness() {
+      foreach (Spring spring in springs){
+        spring.stiffness = stiffness;
+      }
+    }
+
+
+    public void UpdateMass() {
+      foreach (Node node in nodes){
+        node.mass = mass;
+      }
+    }
+
+    public void Move() {
+      SetForces(currentPositions);
+      Verlet();
+    }
+
+    public List<Line> Draw(List < Vector3d > _positions) {
+      List<Line> newlines = new List<Line>();
+      foreach (Spring spring in springs) {
+        newlines.Add(spring.NewLine(_positions));
+        //newlines[spring.index] = spring.NewLine(_positions);
+      }
+      return newlines;
+    }
+  }
+
+
+
+  // </Custom additional code> 
+}
